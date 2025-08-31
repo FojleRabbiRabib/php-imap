@@ -173,6 +173,13 @@ class Client {
     protected string $default_attachment_mask = AttachmentMask::class;
 
     /**
+     * IDLE state tracking - true when any connection is in IDLE mode
+     *
+     * @var bool $idle_active
+     */
+    protected bool $idle_active = false;
+
+    /**
      * Used default account values
      *
      * @var array $default_account_config
@@ -504,6 +511,10 @@ class Client {
      * @throws RuntimeException
      */
     public function disconnect(): Client {
+        // Clear IDLE state before disconnecting
+        if ($this->idle_active) {
+            $this->setIdleActive(false);
+        }
         if ($this->isConnected()) {
             $this->connection->logout();
         }
@@ -965,5 +976,34 @@ class Client {
         }
 
         throw new MaskNotFoundException("Unknown mask provided: ".$mask);
+    }
+
+    /**
+     * Set IDLE state tracking
+     *
+     * @param bool $active
+     * @return void
+     */
+    public function setIdleActive(bool $active): void {
+        $this->idle_active = $active;
+    }
+
+    /**
+     * Check if client is in IDLE mode
+     *
+     * @return bool
+     */
+    public function isIdleActive(): bool {
+        return $this->idle_active;
+    }
+
+    /**
+     * Clone client instance and copy IDLE state
+     *
+     * @return void
+     */
+    public function __clone() {
+        // Copy IDLE state to cloned instance - no need to manually clone as PHP handles it
+        // This method is called automatically when clone is used
     }
 }

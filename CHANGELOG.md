@@ -9,7 +9,13 @@ Updates should follow the [Keep a CHANGELOG](http://keepachangelog.com/) princip
 - Reading whole lines from stream #576 (thanks @wurst-hans)
 
 ### Added
-- NaN
+- Enhanced IDLE mode management with global state tracking
+- Improved IDLE message processing with queue handling
+- Stream timeout handling for better IDLE reliability
+- IDLE state protection preventing commands during IDLE mode
+- Enhanced error handling and connection management for IDLE operations
+- Client IDLE state tracking methods (setIdleActive, isIdleActive)
+- Global IDLE state management to prevent command conflicts
 
 ### Breaking changes
 - NaN

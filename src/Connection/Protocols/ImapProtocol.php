@@ -42,6 +42,12 @@ class ImapProtocol extends Protocol {
     protected int $noun = 0;
 
     /**
+     * Global IDLE state tracking - prevents commands during IDLE
+     * @var bool
+     */
+    protected static bool $global_idle_active = false;
+
+    /**
      * Imap constructor.
      * @param Config $config
      * @param bool $cert_validation set to false to skip SSL certificate validation
@@ -103,6 +109,29 @@ class ImapProtocol extends Protocol {
     public function connected(): bool {
         if ((bool)$this->stream) {
             try {
+                // Check if we're being called from IDLE-related code - if so, skip NOOP
+                $trace = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS);
+                $idle_context_functions = [
+                    'idle', 'setTimeout', 'nextLine', '__destruct', 'disconnect', 'reconnect',
+                    'openFolder', 'fetchStructure', 'parseFlags', 'unsetFlag', 'parseRawBody'
+                ];
+                $idle_context_files = [
+                    'ImapIdleCommand.php', 'Folder.php', 'Message.php'
+                ];
+                
+                foreach ($trace as $frame) {
+                    if (isset($frame['function']) && in_array($frame['function'], $idle_context_functions) ||
+                        isset($frame['file']) && array_reduce($idle_context_files, fn($carry, $file) => $carry || str_contains($frame['file'] ?? '', $file), false)) {
+                        return (bool)$this->stream; // Just check stream status without NOOP
+                    }
+                }
+                
+                // Also check global IDLE state if we have access to the client
+                // This is a more robust check for IDLE state
+                if (method_exists($this, 'getClient') && $this->getClient() && method_exists($this->getClient(), 'isIdleActive') && $this->getClient()->isIdleActive()) {
+                    return (bool)$this->stream;
+                }
+                
                 $this->requestAndResponse('NOOP');
                 return true;
             } catch (ImapServerErrorException|RuntimeException) {
@@ -135,6 +164,21 @@ class ImapProtocol extends Protocol {
      * @throws RuntimeException
      */
     public function nextLine(Response $response): string {
+        // Check if stream has data available using stream_select with timeout for IDLE mode
+        $read = [$this->stream];
+        $write = null;
+        $except = null;
+        $timeout = 30; // 30 second timeout
+        $ready = stream_select($read, $write, $except, $timeout);
+        
+        if ($ready === false) {
+            throw new RuntimeException('stream_select failed');
+        }
+        
+        if ($ready === 0) {
+            throw new RuntimeException('empty response - timeout after ' . $timeout . 's');
+        }
+        
         $line = fgets($this->stream);
         if ($line === false || $line === '') {
             throw new RuntimeException('empty response');
@@ -426,6 +470,11 @@ class ImapProtocol extends Protocol {
         if (!$tag) {
             $this->noun++;
             $tag = 'TAG' . $this->noun;
+        }
+        
+        // CRITICAL: Check if we're in IDLE mode and prevent all commands except DONE
+        if (self::$global_idle_active && strtoupper($command) !== 'DONE') {
+            throw new RuntimeException("IMAP command '{$command}' not allowed during IDLE mode. Only DONE command is permitted.");
         }
 
         $line = $tag . ' ' . $command;
@@ -1477,5 +1526,21 @@ class ImapProtocol extends Protocol {
             $set .= ':' . ($to == INF ? '*' : (int)$to);
         }
         return $set;
+    }
+
+    /**
+     * Set global IDLE state to prevent IMAP commands during IDLE
+     * @param bool $active
+     */
+    public static function setGlobalIdleActive(bool $active): void {
+        self::$global_idle_active = $active;
+    }
+
+    /**
+     * Check if global IDLE state is active
+     * @return bool
+     */
+    public static function isGlobalIdleActive(): bool {
+        return self::$global_idle_active;
     }
 }

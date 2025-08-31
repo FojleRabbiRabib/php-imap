@@ -13,6 +13,7 @@
 namespace Webklex\PHPIMAP;
 
 use Carbon\Carbon;
+use Webklex\PHPIMAP\Connection\Protocols\ImapProtocol;
 use Webklex\PHPIMAP\Connection\Protocols\Response;
 use Webklex\PHPIMAP\Exceptions\AuthFailedException;
 use Webklex\PHPIMAP\Exceptions\ConnectionFailedException;
@@ -439,61 +440,131 @@ class Folder {
             throw new Exceptions\NotSupportedCapabilityException("IMAP server does not support IDLE");
         }
 
+        // Set client IDLE state but NOT global state yet (allow idle client setup)
+        $this->client->setIdleActive(true);
+        
         $idle_client = $this->client->clone();
         $idle_client->connect();
         $idle_client->openFolder($this->path, true);
         $idle_client->getConnection()->idle();
+        
+        // NOW set global IDLE state after IDLE command is sent to server
+        ImapProtocol::setGlobalIdleActive(true);
 
         $last_action = Carbon::now()->addSeconds($timeout);
 
         $sequence = $this->client->getConfig()->get('options.sequence', IMAP::ST_MSGN);
+        $message_queue = []; // Queue to store new message numbers for processing
 
-        while (true) {
-            try {
-                // This polymorphic call is fine - Protocol::idle() will throw an exception beforehand
-                $line = $idle_client->getConnection()->nextLine(Response::empty());
-            } catch (Exceptions\RuntimeException $e) {
-                if(strpos($e->getMessage(), "empty response") >= 0 && $idle_client->getConnection()->connected()) {
-                    continue;
-                }
-                if(!str_contains($e->getMessage(), "connection closed")) {
-                    throw $e;
-                }
-            }
-
-            if (($pos = strpos($line, "EXISTS")) !== false) {
-                $msgn = (int)substr($line, 2, $pos - 2);
-
-                // Check if the stream is still alive or should be considered stale
-                if (!$this->client->isConnected() || $last_action->isBefore(Carbon::now())) {
-                    // Reset the connection before interacting with it. Otherwise, the resource might be stale which
-                    // would result in a stuck interaction. If you know of a way of detecting a stale resource, please
-                    // feel free to improve this logic. I tried a lot but nothing seem to work reliably...
-                    // Things that didn't work:
-                    //      - Closing the resource with fclose()
-                    //      - Verifying the resource with stream_get_meta_data()
-                    //      - Bool validating the resource stream (e.g.: (bool)$stream)
-                    //      - Sending a NOOP command
-                    //      - Sending a null package
-                    //      - Reading a null package
-                    //      - Catching the fs warning
-
+        try {
+            while (true) {
+                try {
                     // This polymorphic call is fine - Protocol::idle() will throw an exception beforehand
-                    $this->client->getConnection()->reset();
-                    // Establish a new connection
-                    $this->client->connect();
+                    $line = $idle_client->getConnection()->nextLine(Response::empty());
+                } catch (Exceptions\RuntimeException $e) {
+                    if(strpos($e->getMessage(), "empty response") >= 0) {
+                        continue;
+                    }
+                    if(!str_contains($e->getMessage(), "connection closed")) {
+                        throw $e;
+                    }
                 }
-                $last_action = Carbon::now()->addSeconds($timeout);
 
-                // Always reopen the folder - otherwise the new message number isn't known to the current remote session
-                $this->client->openFolder($this->path, true);
+                // Handle different types of IMAP responses for new messages
+                if (($pos = strpos($line, "EXISTS")) !== false || 
+                    ($pos = strpos($line, "RECENT")) !== false ||
+                    (strpos($line, "* FETCH") !== false)) {
+                    
+                    // Parse message number for EXISTS and RECENT responses
+                    if (($pos = strpos($line, "EXISTS")) !== false || ($pos = strpos($line, "RECENT")) !== false) {
+                        $msgn = (int)substr($line, 2, $pos - 2);
+                    } elseif (strpos($line, "* FETCH") !== false) {
+                        // Parse message number from FETCH response: "* 12 FETCH ..."
+                        preg_match('/\* (\d+) FETCH/', $line, $matches);
+                        $msgn = isset($matches[1]) ? (int)$matches[1] : null;
+                    }
 
-                $message = $this->query()->getMessageByMsgn($msgn);
-                $message->setSequence($sequence);
-                $callback($message);
+                    if (!isset($msgn) || $msgn <= 0) {
+                        continue; // Skip if we couldn't parse message number
+                    }
 
-                $this->dispatch("message", "new", $message);
+                    // Add current message to queue
+                    $message_queue[] = $msgn;
+                    
+                    // Exit IDLE mode by sending DONE
+                    try {
+                        $idle_client->getConnection()->done();
+                        // Clear global IDLE state after sending DONE
+                        ImapProtocol::setGlobalIdleActive(false);
+                    } catch (\Exception $e) {
+                        // Clear global IDLE state even if DONE failed
+                        ImapProtocol::setGlobalIdleActive(false);
+                    }
+                    
+                    // Process all queued messages outside IDLE
+                    foreach ($message_queue as $queued_msgn) {
+                        try {
+                            // Ensure idle_client connection is active and in correct folder
+                            if (!$idle_client->getConnection()->connected()) {
+                                $idle_client->connect();
+                                $idle_client->openFolder($this->path, true);
+                            }
+                            
+                            // Use the same idle_client connection that detected the message
+                            $message = $idle_client->getFolder($this->path)->query()->getMessageByMsgn($queued_msgn);
+                            $message->setSequence($sequence);
+                            
+                            // Call the callback
+                            $callback($message);
+                            
+                            $this->dispatch("message", "new", $message);
+                        } catch (\Exception $e) {
+                            // Continue processing other messages if one fails
+                        }
+                    }
+                    
+                    // Clear the queue
+                    $message_queue = [];
+                    
+                    // Reset connection and re-establish IDLE
+                    $idle_client->getConnection()->reset();
+                    $idle_client->connect();
+                    $idle_client->openFolder($this->path, true);
+                    $idle_client->getConnection()->idle();
+                    // Re-enable global IDLE state after re-establishing IDLE
+                    ImapProtocol::setGlobalIdleActive(true);
+                
+                    $last_action = Carbon::now()->addSeconds($timeout);
+                }
             }
+        } finally {
+            // Process any remaining queued messages before cleanup
+            if (!empty($message_queue)) {
+                try {
+                    // Exit IDLE mode if still active
+                    $idle_client->getConnection()->done();
+                } catch (\Exception $e) {
+                    // Ignore DONE errors during cleanup
+                }
+                // Clear global IDLE state during cleanup
+                ImapProtocol::setGlobalIdleActive(false);
+                
+                foreach ($message_queue as $queued_msgn) {
+                    try {
+                        // Use the same idle_client connection for cleanup as well
+                        $message = $idle_client->getFolder($this->path)->query()->getMessageByMsgn($queued_msgn);
+                        $message->setSequence($sequence);
+                        $callback($message);
+                        $this->dispatch("message", "new", $message);
+                    } catch (\Exception $e) {
+                        // Continue cleanup even if individual messages fail
+                    }
+                }
+            }
+            
+            // Always clear IDLE state when exiting IDLE mode
+            $this->client->setIdleActive(false);
+            ImapProtocol::setGlobalIdleActive(false);
         }
     }
 

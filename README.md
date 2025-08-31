@@ -24,18 +24,27 @@ Laravel wrapper: [webklex/laravel-imap](https://github.com/Webklex/laravel-imap)
 Discord: [discord.gg/rd4cN9h6][link-discord]
 
 ## Table of Contents
-- [Documentations](#documentations)
-- [Compatibility](#compatibility)
-- [Basic usage example](#basic-usage-example)
-- [Sponsors](#sponsors)
-- [Testing](#testing)
-- [Known issues](#known-issues)
-- [Support](#support)
-- [Features & pull requests](#features--pull-requests)
-- [Alternatives & Different Flavors](#alternatives--different-flavors)
-- [Security](#security)
-- [Credits](#credits)
-- [License](#license)
+- [IMAP Library for PHP](#imap-library-for-php)
+  - [Description](#description)
+  - [Table of Contents](#table-of-contents)
+  - [Documentations](#documentations)
+  - [Compatibility](#compatibility)
+  - [Basic usage example](#basic-usage-example)
+  - [Enhanced IDLE Support](#enhanced-idle-support)
+    - [IDLE Improvements](#idle-improvements)
+  - [Sponsors](#sponsors)
+  - [Testing](#testing)
+    - [Quick-Test / Static Test](#quick-test--static-test)
+    - [Full-Test / Live Mailbox Test](#full-test--live-mailbox-test)
+    - [Known issues](#known-issues)
+  - [Support](#support)
+        - [A little notice](#a-little-notice)
+  - [Features \& pull requests](#features--pull-requests)
+  - [Alternatives \& Different Flavors](#alternatives--different-flavors)
+  - [Change log](#change-log)
+  - [Security](#security)
+  - [Credits](#credits)
+  - [License](#license)
 
 
 ## Documentations
@@ -98,6 +107,36 @@ foreach($folders as $folder){
     }
 }
 ```
+
+## Enhanced IDLE Support
+
+This version includes enhanced IDLE mode functionality with improved reliability and message processing:
+
+```php
+use Webklex\PHPIMAP\ClientManager;
+use Webklex\PHPIMAP\Message;
+
+require_once "vendor/autoload.php";
+
+$cm = new ClientManager('path/to/config/imap.php');
+$client = $cm->account('account_identifier');
+$client->connect();
+
+$folder = $client->getFolder('INBOX');
+
+// IDLE mode with enhanced message queue processing
+$folder->idle(function(Message $message) {
+    echo "New message: " . $message->getSubject() . "\n";
+    // Process the message
+}, 300);
+```
+
+### IDLE Improvements
+- **Global IDLE state tracking** - Prevents conflicting IMAP commands during IDLE
+- **Message queue processing** - Handles multiple simultaneous message arrivals 
+- **Enhanced connection management** - Better handling of connection resets and reconnections
+- **Stream timeout handling** - Improved timeout detection and recovery
+- **Error resilience** - Continues processing even if individual messages fail
 
 ## Sponsors
 [![elb-BIT][ico-sponsor-elb-bit]][link-sponsor-elb-bit]
