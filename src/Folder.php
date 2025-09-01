@@ -452,22 +452,63 @@ class Folder {
         ImapProtocol::setGlobalIdleActive(true);
 
         $last_action = Carbon::now()->addSeconds($timeout);
+        $idle_start_time = Carbon::now();
+        $last_server_response = Carbon::now();
 
         $sequence = $this->client->getConfig()->get('options.sequence', IMAP::ST_MSGN);
         $message_queue = []; // Queue to store new message numbers for processing
 
         try {
             while (true) {
+                // Layer 1: Stream State Validation - Most reliable check
+                if (!$idle_client->getConnection()->connected()) {
+                    throw new ConnectionFailedException("IDLE stream connection lost - exiting for service restart");
+                }
+
+                // Layer 2: Meta Data Analysis - PHP stream health check
+                $stream = $idle_client->getConnection()->getStream();
+                if ($stream) {
+                    $meta = stream_get_meta_data($stream);
+                    if ($meta['timed_out'] || $meta['eof']) {
+                        throw new ConnectionFailedException("IDLE stream state invalid (timed_out: {$meta['timed_out']}, eof: {$meta['eof']}) - exiting for service restart");
+                    }
+                }
+
+                // Layer 3: RFC 2177 29-Minute Rule - Graceful restart
+                if ($idle_start_time->diffInMinutes(Carbon::now()) >= 29) {
+                    throw new ConnectionFailedException("RFC 2177 29-minute IDLE limit reached - exiting for service restart");
+                }
+
+                // Layer 4: Timeout Staleness Check (original logic)  
+                if ($last_action->isBefore(Carbon::now())) {
+                    throw new ConnectionFailedException("IDLE connection timeout reached - exiting for service restart");
+                }
                 try {
                     // This polymorphic call is fine - Protocol::idle() will throw an exception beforehand
                     $line = $idle_client->getConnection()->nextLine(Response::empty());
+                    
+                    // Update last server response time for Layer 4 detection
+                    $last_server_response = Carbon::now();
+                    
                 } catch (Exceptions\RuntimeException $e) {
-                    if(strpos($e->getMessage(), "empty response") >= 0) {
+                    // Handle specific error cases for clean exit
+                    if (str_contains($e->getMessage(), "connection closed") ||
+                        str_contains($e->getMessage(), "stream_select failed") ||
+                        str_contains($e->getMessage(), "empty response") && !str_contains($e->getMessage(), "timeout after")) {
+                        throw new ConnectionFailedException("IDLE connection error: {$e->getMessage()} - exiting for service restart");
+                    }
+                    
+                    // Layer 5: Server Communication Timeout - No server activity for 10+ minutes
+                    if ($last_server_response->diffInMinutes(Carbon::now()) >= 10) {
+                        throw new ConnectionFailedException("No server communication for 10+ minutes - exiting for service restart");
+                    }
+                    
+                    // For timeout messages, continue (this is normal during quiet periods)
+                    if (str_contains($e->getMessage(), "timeout after")) {
                         continue;
                     }
-                    if(!str_contains($e->getMessage(), "connection closed")) {
-                        throw $e;
-                    }
+                    
+                    throw $e;
                 }
 
                 // Handle different types of IMAP responses for new messages
@@ -486,6 +527,11 @@ class Folder {
 
                     if (!isset($msgn) || $msgn <= 0) {
                         continue; // Skip if we couldn't parse message number
+                    }
+                    
+                    // Apply same failure detection during message processing
+                    if (!$idle_client->getConnection()->connected()) {
+                        throw new ConnectionFailedException("IDLE connection lost during message processing - exiting for service restart");
                     }
 
                     // Add current message to queue
@@ -526,13 +572,20 @@ class Folder {
                     // Clear the queue
                     $message_queue = [];
                     
-                    // Reset connection and re-establish IDLE
-                    $idle_client->getConnection()->reset();
-                    $idle_client->connect();
-                    $idle_client->openFolder($this->path, true);
-                    $idle_client->getConnection()->idle();
-                    // Re-enable global IDLE state after re-establishing IDLE
-                    ImapProtocol::setGlobalIdleActive(true);
+                    // Re-establish IDLE with clean exit on failure
+                    try {
+                        // Verify connection before re-establishing IDLE
+                        if (!$idle_client->getConnection()->connected()) {
+                            throw new ConnectionFailedException("Connection lost before re-establishing IDLE - exiting for service restart");
+                        }
+                        
+                        $idle_client->getConnection()->idle();
+                        // Re-enable global IDLE state after re-establishing IDLE
+                        ImapProtocol::setGlobalIdleActive(true);
+                    } catch (\Exception $e) {
+                        // Clean exit on any IDLE re-establishment failure
+                        throw new ConnectionFailedException("Failed to re-establish IDLE: {$e->getMessage()} - exiting for service restart");
+                    }
                 
                     $last_action = Carbon::now()->addSeconds($timeout);
                 }
